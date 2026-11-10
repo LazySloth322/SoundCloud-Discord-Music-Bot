@@ -4,6 +4,7 @@ venv/
 .venv/
 
 .env*
+config.py
 
 *.py[cod]
 

@@ -486,7 +486,8 @@ idle_manager = IdleMonitorManager(bot)
 # --------------------------------------------------------------------------- #
 
 def _make_after_callback(guild_id: int,
-                         stderr_sink: Optional[io.BytesIO] = None):
+                         stderr_sink: Optional[io.BytesIO] = None,
+                         source=None):
     """Build the FFmpeg player "after" callback.
 
     This callback runs on the *player thread*, never on the event loop, so the
@@ -501,6 +502,13 @@ def _make_after_callback(guild_id: int,
     silent.
     """
     def _after_track(error: Optional[Exception]) -> None:
+        # If the watchdog is handling the skip, do nothing — the watchdog
+        # will call _on_track_ended() directly. Without this guard we'd
+        # advance the queue twice (skip one extra track).
+        if source is not None and getattr(source, "_skip_already_handled", False):
+            logger.debug(f"After-callback suppressed for guild {guild_id} "
+                         f"(force-skip handled advancement)")
+            return
         if error is not None:
             logger.error(f"Player error in guild {guild_id}: {error!r}")
             if stderr_sink is not None:
@@ -572,6 +580,151 @@ async def _on_track_ended(guild_id: int) -> None:
         logger.info(f'Queue ended in "{guild.name}"')
         idle_manager.bump(guild_id)
 
+###################################
+###################################
+###################################
+
+# --------------------------------------------------------------------------- #
+#  Playback watchdog helpers                                                  #
+# --------------------------------------------------------------------------- #
+
+PLAYBACK_WATCHDOG_INITIAL_DELAY     = float(_cfg("PLAYBACK_WATCHDOG_INITIAL_DELAY", 8))
+PLAYBACK_WATCHDOG_MIN_STARTUP_BYTES = int(_cfg("PLAYBACK_WATCHDOG_MIN_STARTUP_BYTES", 4096))
+PLAYBACK_WATCHDOG_CHECK_INTERVAL    = float(_cfg("PLAYBACK_WATCHDOG_CHECK_INTERVAL", 15))
+PLAYBACK_WATCHDOG_STALL_TIMEOUT     = float(_cfg("PLAYBACK_WATCHDOG_STALL_TIMEOUT", 30))
+
+
+class _CountedFFmpegOpusAudio(discord.FFmpegOpusAudio):
+    """FFmpegOpusAudio that counts the bytes ffmpeg has actually produced.
+
+    Used by the playback watchdog to distinguish a *working* track (audio
+    flows, bytes_read grows) from a *dead* track (ffmpeg spawned but is
+    producing nothing — typically a 403 on a signed SoundCloud CDN URL
+    because ffmpeg's User-Agent differs from yt-dlp's).
+    """
+    def __init__(self, *args, **kwargs):
+        self.bytes_read = 0
+        self._skip_already_handled = False
+        super().__init__(*args, **kwargs)
+
+    def read(self):
+        data = super().read()
+        if data:
+            self.bytes_read += len(data)
+        return data
+
+async def _force_skip_track(ctx,
+                            guild: discord.Guild,
+                            voice_client: discord.VoiceClient,
+                            source: _CountedFFmpegOpusAudio,
+                            reason: str) -> None:
+    """Skip the current track deterministically.
+
+    Unlike plain ``voice_client.stop()``, this does not depend on the after
+    callback firing — it advances the queue itself, so a dead-ffmpeg track is
+    replaced immediately. The flag on ``source`` tells the after callback
+    (which *also* fires when we call stop()) to stay out of the way, so the
+    queue is only advanced once.
+    """
+    guild_id = guild.id
+    logger.warning(f'Force-skip in "{guild.name}": {reason}')
+    await ctx.channel.send(f'ERROR: Force-skip in "{guild.name}": {reason}')
+
+    source._skip_already_handled = True         # tell after-callback to no-op
+
+    try:
+        voice_client.stop()
+    except Exception as exc:
+        logger.debug(f"voice_client.stop() raised in force-skip: {exc!r}")
+
+    await _on_track_ended(guild_id)             # advance the queue ourselves
+
+async def _playback_watchdog(ctx,
+                             guild: discord.Guild,
+                             voice_client: discord.VoiceClient,
+                             source: _CountedFFmpegOpusAudio,
+                             stderr_sink: io.BytesIO,
+                             track_name: str) -> None:
+    """Force-skip tracks that 'play' silently and stall the queue.
+
+    Stage 1 — startup check: after a few seconds, if the voice client still
+    reports *playing* but ffmpeg has produced almost nothing, the stream URL
+    is dead (403 / bad signature / unreachable). Force-stop, which triggers
+    the normal `after` callback and advances the queue.
+
+    Stage 2 — long-running stall: keep checking that bytes are still arriving.
+    If the stream breaks mid-track, force-stop it too.
+    """
+    try:
+        # -------- stage 1: startup check ------------------------------------
+        await asyncio.sleep(PLAYBACK_WATCHDOG_INITIAL_DELAY)
+        if not voice_client.is_connected():
+            return
+        if voice_client.is_paused() or not voice_client.is_playing():
+            pass  # fall through to stage 2 with whatever state we're in
+        elif source.bytes_read < PLAYBACK_WATCHDOG_MIN_STARTUP_BYTES:
+            stderr_text = ""
+            try:
+                stderr_text = stderr_sink.getvalue().decode(errors="ignore").strip()
+            except Exception:
+                pass
+            logger.warning(
+                f'Playback watchdog: "{track_name}" in "{guild.name}" produced '
+                f'only {source.bytes_read} bytes in {PLAYBACK_WATCHDOG_INITIAL_DELAY:.0f}s '
+                f'— forcing skip. ffmpeg stderr: {stderr_text[:400]!r}'
+            )
+            #await ctx.message.reply(ADD_UNAVAILABLE_OR_AGE_RESTRICTION)
+            await _force_skip_track(ctx,
+                guild, voice_client, source,
+                reason=(f'"{track_name}" produced only {source.bytes_read} bytes '
+                        f'in {PLAYBACK_WATCHDOG_INITIAL_DELAY:.0f}s — '
+                        f'ffmpeg stderr: {stderr_text[:400]!r}')
+            )
+            return
+
+        # -------- stage 2: ongoing stall detection --------------------------
+        last_bytes = source.bytes_read
+        last_progress = time.monotonic()
+        while voice_client.is_connected():
+            await asyncio.sleep(PLAYBACK_WATCHDOG_CHECK_INTERVAL)
+
+            # a new track already replaced ours — nothing more to watch
+            player = getattr(voice_client, "_player", None)
+            current_source = getattr(player, "source", None) if player else None
+            if current_source is not source:
+                return
+            if not voice_client.is_playing() and not voice_client.is_paused():
+                return  # track ended on its own
+
+            if voice_client.is_paused():
+                last_progress = time.monotonic()   # pause is not a stall
+                continue
+
+            current_bytes = source.bytes_read
+            now = time.monotonic()
+            if current_bytes > last_bytes:
+                last_bytes = current_bytes
+                last_progress = now
+            elif now - last_progress > PLAYBACK_WATCHDOG_STALL_TIMEOUT:
+                logger.warning(
+                    f'Playback watchdog: "{track_name}" in "{guild.name}" '
+                    f'stalled for {PLAYBACK_WATCHDOG_STALL_TIMEOUT:.0f}s — forcing skip'
+                )
+                #await ctx.message.reply(ADD_UNAVAILABLE_OR_AGE_RESTRICTION)
+                await _force_skip_track(
+                    guild, voice_client, source,
+                    reason=(f'"{track_name}" stalled for '
+                            f'{PLAYBACK_WATCHDOG_STALL_TIMEOUT:.0f}s')
+                )
+                return
+    except asyncio.CancelledError:
+        pass
+    except Exception as exc:
+        logger.error(f"Playback watchdog error in \"{guild.name}\": {exc!r}")
+
+###################################
+###################################
+###################################
 
 async def audio_player(ctx, voice_client=None, interrupt_paused: bool = False) -> int:
     """Resolve the stream URL for the current track and start playback.
@@ -626,16 +779,33 @@ async def audio_player(ctx, voice_client=None, interrupt_paused: bool = False) -
                 songs_queue.set_no_play_time(serverid, 0.0)
                 songs_queue.set_jump_used(serverid, False)   # jump flag has served its purpose
                 # collect ffmpeg's stderr so playback failures can be diagnosed
+                # stderr_sink = io.BytesIO()
+                # ffmpeg_kwargs = dict(FFMPEG_OPTIONS)
+                # ffmpeg_kwargs.setdefault("stderr", stderr_sink)
+                # voice_client.play(
+                    # discord.FFmpegOpusAudio(source=stream_link, **ffmpeg_kwargs),
+                    # after=_make_after_callback(serverid, stderr_sink),
+                # )
+                # idle_manager.ensure(serverid)
+                # idle_manager.bump(serverid)                  # playing a track resets the idle timer
+                # logger.info(f'Now playing "{songs_queue.get_track_name(serverid)}" in "{guild.name}"')
+                # return 0
                 stderr_sink = io.BytesIO()
                 ffmpeg_kwargs = dict(FFMPEG_OPTIONS)
                 ffmpeg_kwargs.setdefault("stderr", stderr_sink)
+                track_name = songs_queue.get_track_name(serverid)
+                source = _CountedFFmpegOpusAudio(source=stream_link, **ffmpeg_kwargs)
                 voice_client.play(
-                    discord.FFmpegOpusAudio(source=stream_link, **ffmpeg_kwargs),
-                    after=_make_after_callback(serverid, stderr_sink),
+                    source,
+                    after=_make_after_callback(serverid, stderr_sink, source),
                 )
                 idle_manager.ensure(serverid)
                 idle_manager.bump(serverid)                  # playing a track resets the idle timer
-                logger.info(f'Now playing "{songs_queue.get_track_name(serverid)}" in "{guild.name}"')
+                logger.info(f'Now playing "{track_name}" in "{guild.name}"')
+                asyncio.create_task(
+                    _playback_watchdog(ctx, guild, voice_client, source, stderr_sink, track_name),
+                    name=f"tolya-playback-watchdog-{serverid}",
+                )
                 return 0
 
             # unresolvable track: mark it and move on (legacy behaviour)
