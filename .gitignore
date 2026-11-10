@@ -1,0 +1,12 @@
+.idea/
+__pycache__/
+venv/
+.venv/
+
+.env*
+
+*.py[cod]
+
+*.csv
+*.log
+*.lnk
