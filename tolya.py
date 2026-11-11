@@ -383,8 +383,11 @@ class IdleMonitor:
         return self._task is not None and not self._task.done()
 
     def cancel(self) -> None:
-        if self._task is not None and not self._task.done():
-            self._task.cancel()
+        task = self._task
+        if (task is not None
+                and not task.done()
+                and task is not asyncio.current_task()): 
+            task.cancel()
 
     # -- activity --------------------------------------------------------- #
 
@@ -711,7 +714,7 @@ async def _playback_watchdog(ctx,
                     f'stalled for {PLAYBACK_WATCHDOG_STALL_TIMEOUT:.0f}s — forcing skip'
                 )
                 #await ctx.message.reply(ADD_UNAVAILABLE_OR_AGE_RESTRICTION)
-                await _force_skip_track(
+                await _force_skip_track(ctx,
                     guild, voice_client, source,
                     reason=(f'"{track_name}" stalled for '
                             f'{PLAYBACK_WATCHDOG_STALL_TIMEOUT:.0f}s')
@@ -1373,7 +1376,7 @@ async def disconnect(ctx, fromTimeout=False):
             await ctx.message.reply(BOT_DEFAULT_REPLY_ON_SUCCESS)
             logger.info(f"Disconnected in server \"{ctx.guild.name}\" by {ctx.message.author}")
         else:
-            await ctx.send(DISCONNECT_DISCONNECTED_BY_AFK)
+            await ctx.channel.send(DISCONNECT_DISCONNECTED_BY_AFK)
             logger.info(f"Disconnected due to timeout of 5 minutes in \"{ctx.guild.name}\"")
     else:
         if not fromTimeout:
